@@ -1,27 +1,64 @@
-# ---------------------------------------------------------------------------- #
-#                               Courant Timestep                               #
-# ---------------------------------------------------------------------------- #
-function courant_timestep(model::MPMModel, cfl_factor::T=0.5) where {T} 
-    # Extract necessary information from the model
+using SmashMPM
+using StaticArrays
+using BenchmarkTools
+using Profile
+using LinearAlgebra
+using Atomix: @atomic
+using AMDGPU
+using KernelAbstractions
+
+# backend = ROCBackend()
+backend = CPU()
+
+
+center = SVector{3, Float64}(0.0, 0.0, 0.0)
+R = 1.0
+h = 1.0
+euler_angles = SVector{3, Float64}(0.0, 0.0, 0.0)
+
+shape1 = Cylinder(center, R, h, euler_angles)
+
+linear_vel = SVector{3, Float64}(0.0, 0.0, 0.0)
+rot_speed = 2π/5.0 
+rotational_vec = SVector{3, Float64}(0.0, 0.0, rot_speed)
+mat = NeoHookean(ρ=1000.0, E=1e6, ν=0.3)
+
+body = Body(shape1, linear_vel, rotational_vec, mat)
+bodies = (body,)
+
+Setup = SimulationSetup(dx=0.1, t_end=1.0, backend=backend)
+
+model = build_mpm_model(bodies, Setup)
+
+N_particles = length(model.particle_sets[1].particles.pos)
+dims = size(model.grid.state_old.mass)
+
+println("Model built successfully with $N_particles particles and a grid of size $dims.")
+
+function g2p2g_non_kernel(model::MPMModel, dt)
     grid = model.grid
-   
-    dt_courant = cfl_factor / (grid.inv_dx * max_wavespeed(grid))
-    
-    return min(dt_courant, model.dt_max)
+    particle_sets = model.particle_sets
+    spline = model.shapefunction
+
+    origin = grid.origin
+    inv_dx = grid.inv_dx
+    padding = grid.padding
+
+    for particle_set in particle_setss
+        for p_idx in 1:length(particle_set.particles.pos)
+            g2p2g_quasi_kernel!(grid.state_old, grid.state_new, particle_set, origin, inv_dx, padding, spline, dt, p_idx)
+        end
+    end
+
 end
 
-
-
-# ---------------------------------------------------------------------------- #
-#                                     G2P2G                                    #
-# ---------------------------------------------------------------------------- #
-@kernel function g2p2g_kernel!(
+function g2p2g_quasi_kernel!(
     state_old, state_new,
     particle_set,
     origin, inv_dx::T, padding, spline,
-    dt::T
+    dt::T, p_idx::Int
 ) where T
-    p_idx = @index(Global, Linear)
+    # p_idx = @index(Global, Linear)
 
     # Extract particle properties
     pos_old = particle_set.particles.pos[p_idx]
@@ -31,9 +68,9 @@ end
     vel = zero(SVector{3, T})
     B = zero(SMatrix{3, 3, T, 9})
 
-    grid_pos_old = get_grid_position(pos_old, inv_dx, origin, padding)
-    base_node_old = get_support_base(spline, grid_pos_old)
-    iterator_i, iterator_j, iterator_k = get_support_offsets(spline)
+    grid_pos_old = SmashMPM.get_grid_position(pos_old, inv_dx, origin, padding)
+    base_node_old = SmashMPM.get_support_base(spline, grid_pos_old)
+    iterator_i, iterator_j, iterator_k = SmashMPM.get_support_offsets(spline)
 
     for di in iterator_i, dj in iterator_j, dk in iterator_k
         i = base_node_old[1] + di
@@ -45,14 +82,15 @@ end
         end
 
         natural_coords = grid_pos_old - SVector(i, j, k)
-        r_rel = - natural_coords * (1 / inv_dx) 
+        r_rel = - natural_coords * (1 / inv_dx)
+        # @assert type(r_rel) == SVector{3, T} "r_rel should be of type SVector{3, T}, but got $(typeof(r_rel))"
         N = shapefunction(spline, natural_coords)
 
         # G2P: Interpolate grid velocity to particle
         if state_old.mass[i, j, k] > 0
             v_grid = state_old.momentum[i, j, k] / state_old.mass[i, j, k]
             vel = vel + N * v_grid
-            B = B + B_update(spline, N, r_rel, v_grid)
+            B = B + SmashMPM.B_update(spline, N, r_rel, v_grid)
         end
     end
 
@@ -60,7 +98,7 @@ end
     particle_set.particles.pos[p_idx] = pos_old + vel * dt
     
     # Finalize affine velocity update
-    C = B * M_inv(spline, inv_dx)
+    C = B * SmashMPM.M_inv(spline, inv_dx)
 
     # Update particle state
     F_old = particle_set.particles.F[p_idx]
@@ -77,12 +115,12 @@ end
     soundspeed_new = get_soundspeed(particle_set.material, mat_state_new)
     wavespeed_new = soundspeed_new + norm(vel)
     
-    affine = - dt * vol_new * σ * M_inv(spline, inv_dx) + mass * C
+    affine = - dt * vol_new * σ * SmashMPM.M_inv(spline, inv_dx) + mass * C
 
     # P2G: Transfer updated particle state to state_new
-    grid_pos_new = get_grid_position(particle_set.particles.pos[p_idx], inv_dx, origin, padding)
-    base_node_new = get_support_base(spline, grid_pos_new)
-    # iterator_i, iterator_j, iterator_k = get_support_offsets(spline)
+    grid_pos_new = SmashMPM.get_grid_position(particle_set.particles.pos[p_idx], inv_dx, origin, padding)
+    base_node_new = SmashMPM.get_support_base(spline, grid_pos_new)
+    # iterator_i, iterator_j, iterator_k = SmashMPM.get_support_offsets(spline)
     for di in iterator_i, dj in iterator_j, dk in iterator_k
         i = base_node_new[1] + di
         j = base_node_new[2] + dj
@@ -106,23 +144,11 @@ end
 
 end
 
-function g2p2g!(model::MPMModel, dt)
-    grid = model.grid
-    particle_sets = model.particle_sets
-    spline = model.shapefunction
 
-    origin = grid.origin
-    inv_dx = grid.inv_dx
-    padding = grid.padding
 
-    backend = model.backend
+g2p2g!(model, 1e-5)
+display(@benchmark g2p2g!($model, 1e-5))
 
-    kernel = g2p2g_kernel!(backend)
+Profile.clear_malloc_data()
 
-    foreach(particle_sets) do particle_set
-        kernel(grid.state_old, grid.state_new, particle_set, origin, inv_dx, padding, spline, dt;
-               ndrange=length(particle_set.particles.pos))
-    end
-
-    KernelAbstractions.synchronize(backend)
-end
+g2p2g!(model, 1e-5)
